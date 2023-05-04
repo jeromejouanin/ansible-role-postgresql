@@ -1,2 +1,2 @@
 # ansible-role-postgresql
-An ansible role to install PostgreSQL
+An Ansible Role that install and manage a PostgreSQL (http://www.postgresql.org/) server.
