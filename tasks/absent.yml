@@ -1,0 +1,20 @@
+---
+
+- name: Drop database
+  include_tasks: drop_database.yml
+
+- name: Ensure PostgreSQL is stopped and deactivate
+  service:
+    name: "{{ postgresql_service_name }}"
+    enabled: false
+    state: stopped
+
+- name: UNInstall PostgreSQL (Debian)
+  apt:
+    name: postgresql{{ '-' ~ postgresql_version if postgresql_version is defined else '' }}
+    state: absent
+
+- name: Remove PostgreSQL dir
+  file:
+    name: "/var/lib/postgresql/{{ postgresql_version }}"
+    state: absent

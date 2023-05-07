@@ -1,0 +1,21 @@
+---
+# update hba dans un emplacement temporaire pour pouvoir assembler toutes les modifications en une fois à la fin
+# et ne pas faire plusieurs modifications itératives dans le role à différents endroits
+
+- name: "assemble pg_hba.conf final file"
+  assemble:
+    src: "{{ pg_hba_conf_tmp_dir }}"
+    dest: "{{ postgresql_conf_dir }}/pg_hba.conf"
+    owner: "{{ postgresql_user_name }}"
+    group: "{{ postgresql_user_name }}"
+    mode: 0400
+    backup: true
+  notify: Reload PostgreSQL
+#  tags:
+#    - pg_hba_conf
+#    - pg_conf
+
+- name: "Delete {{ pg_hba_conf_tmp_dir }} temp dir"
+  file:
+    path: "{{ pg_hba_conf_tmp_dir }}"
+    state: absent

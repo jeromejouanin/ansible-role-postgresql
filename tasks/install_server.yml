@@ -1,0 +1,95 @@
+---
+
+# Convenient ordering - debian.yml sets postgresql_version if it is unset,
+# which is needed by the include_vars files.
+- include_tasks: install_server_debian.yml
+  when: ansible_os_family == "Debian"
+
+# Needs postgresql_pgdata set
+- include_tasks: install_server_redhat.yml
+  when: ansible_os_family == "RedHat"
+
+- name: Create conf.d
+  file:
+    path: "{{ postgresql_conf_dir }}/conf.d"
+    state: directory
+    owner: "{{ postgresql_user_name }}"
+    group: "{{ postgresql_user_name }}"
+    mode: 0750
+
+# lineinfile's behavior when `backrefs = True` is very odd. We don't want to overwrite include_dirs if it's already
+# properly set, but we don't know the exact format it will be in (with or without '=', with a comment at end of line,
+# etc.). So check for a match first and then add if there's no match.
+- name: Check for conf.d include in postgresql.conf
+  lineinfile:
+    line: 'why ansible ;('
+    # The '=' is optional but is present in postgresql.conf.sample, which Debian's sample is based off of (but include*
+    # directive examples in the PostgreSQL docs don't use it). Also ignore comments and whitespace after the directive.
+    regexp: '^include_dir(\s+|\s*=\s*)?''conf.d''\s*(#.*)?$'
+    path: "{{ postgresql_conf_dir }}/postgresql.conf"
+    backrefs: true
+  check_mode: true
+  changed_when: __postgresql_include_dir_result is not changed  # yeah...
+  register: __postgresql_include_dir_result
+  when: "postgresql_version is version_compare('9.3', '>=')"
+
+- name: Set conf.d include in postgresql.conf
+  lineinfile:
+    line: "include_dir 'conf.d'"
+    path: "{{ postgresql_conf_dir }}/postgresql.conf"
+    backup: true
+  notify: Reload PostgreSQL
+  when: "postgresql_version is version_compare('9.3', '>=') and __postgresql_include_dir_result is changed"
+
+- name: Set config options
+  template:
+    src: 25ansible_postgresql.conf.j2
+    dest: "{{ postgresql_conf_dir }}/conf.d/25ansible_postgresql.conf"
+    owner: "{{ postgresql_user_name }}"
+    group: "{{ postgresql_user_name }}"
+    mode: 0640
+    backup: true
+  notify: Reload PostgreSQL
+#  tags:
+#    - pg_conf
+
+- name: Change date format
+  lineinfile:
+    path: "/etc/postgresql/{{ postgresql_version }}/main/postgresql.conf"
+    search_string: "datestyle = 'iso, mdy'"
+    line: "datestyle = 'iso, dmy'"
+  when: pg_change_date_format
+  notify: Reload PostgreSQL
+#  tags:
+#    - pg_conf
+
+- name: Change listen address
+  lineinfile:
+    path: "/etc/postgresql/{{ postgresql_version }}/main/postgresql.conf"
+    regexp: "^#listen_addresses = 'localhost'"
+    line: "listen_addresses '*'"
+    insertbefore: "#listen_addresses = 'localhost'         # what IP address(es) to listen on;"
+  when: pg_open_listen_address
+  notify: Restart PostgreSQL
+#  tags:
+#    - pg_conf
+
+- name: Install packages needed by community.postgresql ansible collection
+  ansible.builtin.apt:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - python3-psycopg2
+
+- name: "REVOKE CONNECT ON DATABASE postgres & template FROM PUBLIC"
+  become_user: postgres
+  community.postgresql.postgresql_privs:
+    db: "{{ item }}"
+    privs: CONNECT
+    type: database
+    roles: PUBLIC
+    state: absent
+  loop:
+    - postgres
+#    - template0
+    - template1

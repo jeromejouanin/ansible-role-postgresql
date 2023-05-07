@@ -1,0 +1,15 @@
+---
+
+# Si mode install, initialisation d'un hba
+# dans un emplacement temporaire pour pouvoir assembler toutes les modifications en une fois à la fin
+# et ne pas faire plusieurs modifications itératives dans le role à différents endroits
+# sinon on traite directement le fichier en place
+- name: Allow auth method connection for the database user {{ db_user_params.db_user }}
+  postgresql_pg_hba:
+    dest: "{{ pg_hba_conf_tmp_dir if postgresql_install_server else '/etc/postgresql/'+ postgresql_version|string +'/main' }}/pg_hba.conf"
+    contype: host
+    databases: "{{ 'all' if db_user_params.db_user_role == 'superuser' else _db_name }}"
+    users: "{{ db_user_params.db_user }}"
+    address: all
+    method: "{{ pg_client_auth_method }}"
+  notify: Reload PostgreSQL

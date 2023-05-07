@@ -1,0 +1,23 @@
+---
+# update hba dans un emplacement temporaire pour pouvoir assembler toutes les modifications en une fois à la fin
+# et ne pas faire plusieurs modifications itératives dans le role à différents endroits
+
+- name: "Create {{ pg_hba_conf_tmp_dir }} temp dir"
+  file:
+    path: "{{ pg_hba_conf_tmp_dir }}"
+    state: directory
+    mode: 0755
+#  tags:
+#    - pg_conf
+
+- name: Create default pg_hba.conf
+  template:
+    src: pg_hba.conf.j2
+    dest: "{{ pg_hba_conf_tmp_dir }}/pg_hba.conf"
+    owner: "{{ postgresql_user_name }}"
+    group: "{{ postgresql_user_name }}"
+    mode: 0400
+#    backup: true
+#  notify: Reload PostgreSQL
+#  tags:
+#    - pg_conf

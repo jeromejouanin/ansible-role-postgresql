@@ -1,0 +1,108 @@
+---
+
+- name: Install postgresql Server and configuration
+  include_tasks: install_server.yml
+  when: postgresql_install_server
+#  tags:
+#    - pg_conf
+
+- name: Install backup configuration and tools
+  include_tasks: install_backup.yml
+  when:
+    - postgresql_backup_dir is defined
+    - postgresql_install_server
+
+- name: Ensure PostgreSQL is running
+  service:
+    name: "{{ postgresql_service_name }}"
+    enabled: true
+    state: started
+
+- name: Init pg_hba configuration (in temp dir) WHEN INSTALL
+  include_tasks: pg_hba_init.yml
+  when: postgresql_install_server
+#  tags:
+#    - pg_hba_conf
+#    - pg_conf
+
+- name: when db_list is defined block
+  when:
+    - db_list is defined
+    - db_list|length >0
+    - pg_create_db
+  block:
+    - debug:
+        msg: "[Info] Mode db_list => boucle sur db_list"
+
+    - name: Create databases from db_list
+      include_tasks: create_database.yml
+      loop: "{{ db_list }}"
+      loop_control:
+        loop_var: db_name
+
+    - name: Collect databases info
+      become_user: postgres
+      community.postgresql.postgresql_info:
+        filter: "databases"
+      register: databases_info
+
+    #Remarque :
+    #A noter que lorsque l'on utilise la fonctionnalité db_list avec des schémas, cela fait faire un grand nombre de boucle au code.
+    #Car il y a 2 niveaux de boucle dans ce cas :
+    #- boucle 1 dans main.yml sur la liste des bases (ex: db1.sc1, db1.sc2, db1.sc3, db2.sc1, db2.sc2, ...)
+    #- boucle 2 dans create_users_and_perms.yml sur la liste des comptes à créer
+    #Dans ce cas l'exécution du playbook n'est pas très lisible..
+
+    - name: Create users and perms from db_list
+      include_tasks: create_users_and_perms.yml
+      loop: "{{ db_list }}"
+      loop_control:
+        loop_var: db_name
+
+- name: when db_list is not defined block
+  when: db_list is not defined
+  block:
+    - debug:
+        msg: "[Info] Mode db_name => 1 seule bdd traitée"
+
+    - name: Drop database
+      include_tasks: drop_database.yml
+      when: pg_drop_db
+
+    - name: Create database
+      include_tasks: create_database.yml
+      when: pg_create_db
+
+    - name: Collect databases info
+      become_user: postgres
+      community.postgresql.postgresql_info:
+        filter: "databases"
+      register: databases_info
+
+    - name: Create users and perms
+      include_tasks: create_users_and_perms.yml
+      when: pg_create_db
+
+    - name: Dump database
+      include_tasks: dump_database.yml
+      when: pg_dump_db
+
+    - name: Restore database
+      include_tasks: restore_database.yml
+      when: pg_restore_db
+
+# Gestion pg_hba.conf
+- name: Add specific lines in pg_hba.conf when defined
+  when: postgresql_pg_hba_conf is defined
+  lineinfile:
+    path: "/etc/postgresql/{{ postgresql_version }}/main/pg_hba.conf"
+    line: "{{ item |replace(' ','\t') }}"
+  loop: "{{ postgresql_pg_hba_conf }}"
+  notify: Reload PostgreSQL
+
+- name: Assemble pg_hba configuration WHEN INSTALL
+  include_tasks: pg_hba_assemble.yml
+  when: postgresql_install_server
+#  tags:
+#    - pg_hba_conf
+#    - pg_conf

@@ -1,0 +1,67 @@
+---
+
+postgresql_install_server: false
+postgresql_flavor: pgdg # ou apt pour avoir les packages de la version de la distrib OS Debian courante
+postgresql_version: 14
+postgresql_user_name: postgres
+
+# Point-In-Time Recovery (PITR) backup options
+#   https://www.postgresql.org/docs/current/continuous-archiving.html
+# where backup files will be placed
+postgresql_backup_dir: /var/backups/postgres
+# where backup scripts will be placed
+postgresql_tools_dir: >-
+  {{ '/var/lib/pgsql' if ansible_os_family == 'RedHat' else (
+      '/var/lib/postgresql' if ansible_os_family == 'Debian' else '~postgres') }}/tools
+postgresql_create_backup_dir: true
+
+postgresql_wal_level: minimal # minimal | replica (defaut) | logical
+
+# Options used for the WAL archive command - do not change this unless you have read the PITR documentation and
+# understand how this command must work.
+postgresql_archive_wal_rsync_args: '--ignore-existing -ptg --info=skip1'
+
+# These options are passed to all calls of rsync (in addition to backups, rsync is used to clean up old backups)
+postgresql_backup_rsync_connect_opts: ''
+# These options are passed only to the call of rsync that performs the backup
+postgresql_backup_rsync_backup_opts: '-rptg'
+
+# Keep this many old backups
+postgresql_backup_keep: 1
+
+postgresql_backup_command: "{{ postgresql_tools_dir | quote }}/bin/pg_backup.sh -a"
+postgresql_backup_script: "{{ postgresql_tools_dir | quote }}/bin/pg_backup.sh"
+
+postgresql_pg_hba_local_postgres_user: true
+postgresql_pg_hba_local_socket: true
+postgresql_pg_hba_local_ipv4: true
+postgresql_pg_hba_local_ipv6: false
+
+postgresql_pg_hba_generic_conf:
+  - host all all 192.168.193.0/24 md5
+  - host all all 10.100.255.0/24 md5
+
+#postgresql_pg_hba_conf:   # A definir dans l'inventaire comme souhaité
+
+# specific option
+#inventory_file_key: "{{ (inventory_file | basename).split('.')[0] }}"
+pg_create_db: true
+pg_dump_db: false
+pg_drop_db: false
+pg_restore_db: false
+#postgresql_create_user_read: false
+pg_open_listen_address: true
+pg_change_date_format: true
+#postgresql_db_purpose: false
+
+pg_client_auth_method: "{{ 'md5' if ansible_os_family == 'Debian' else 'ident' if ansible_os_family == 'RedHat' }}"
+# pg_backup_crypt_pass: !vault |
+#                       $ANSIBLE_VAULT;1.1;AES256
+#                       xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# permet de changer le owner (postgres par défaut) du schéma public pour le dbowner
+public_schema_owns_to_db_owner: true
+# permet d'interdire de créer des objets sur le schéma public aux utilisateurs non admin/owner
+forbid_create_objs_on_public_schema: true
+
+exclude_sys_schema_list: "'pg_toast','pg_catalog','information_schema','logs','adm'"

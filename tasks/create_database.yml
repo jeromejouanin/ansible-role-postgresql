@@ -1,0 +1,37 @@
+---
+
+- name: create database block
+  become_user: postgres
+  block:
+
+    - set_fact:
+        _db_name: "{{ db_name.split('.')[0] }}"
+        _db_schema_name: "{{ db_name.split('.')[1]|default('public') }}"
+
+    # psql -c "create database ${DB_NAME} WITH ENCODING 'UTF8' LC_COLLATE='fr_FR.UTF-8' LC_CTYPE='fr_FR.UTF-8' OWNER='${USERNAME}';"
+    - name: Create database {{ _db_name }}
+      community.postgresql.postgresql_db:
+        state: present
+        name: "{{ _db_name }}"
+#        owner: "{{ db_user }}"
+        encoding: UTF-8
+        lc_collate: fr_FR.UTF-8
+        lc_ctype: fr_FR.UTF-8
+      register: _create_db_result
+
+    - name: Create schema {{ _db_name }}.{{ _db_schema_name }} when defined
+      community.postgresql.postgresql_schema:
+        db: "{{ _db_name }}"
+        name: "{{ _db_schema_name }}"
+      when: _db_schema_name != 'public'
+
+
+    - name: REVOKE CONNECT ON DATABASE {{ _db_name }} FROM PUBLIC
+      community.postgresql.postgresql_privs:
+        db: "{{ _db_name }}"
+        privs: CONNECT
+        type: database
+        roles: PUBLIC
+        state: absent
+      when:
+        _create_db_result.changed

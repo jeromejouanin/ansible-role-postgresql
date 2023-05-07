@@ -1,0 +1,32 @@
+---
+
+# maps ansible_* to the pgdg repository package name
+postgresql_pgdg_families:
+  # default: redhat
+  Fedora: fedora
+
+postgresql_pgdg_shortfamilies:
+  # default: EL
+  Fedora: F
+
+__postgresql_pgdg_bin_dir: "{{ '/usr/pgsql-' ~ (postgresql_version | replace('.', '')) ~ '/bin' }}"
+#backup.py requiert psycopg2 etc
+#postgresql_backup_command: >-
+#  {{ postgresql_tools_dir | quote }}/bin/backup.py
+#  {{ '--rsync-connect-opts ' ~ (postgresql_backup_rsync_connect_opts | quote) if postgresql_backup_rsync_connect_opts else '' }}
+#  --rsync-backup-opts {{ postgresql_backup_rsync_backup_opts | quote }}
+#  --keep {{ postgresql_backup_keep | quote }}
+#  {{ '--pg-bin-dir ' ~ __postgresql_pgdg_bin_dir if ansible_os_family == 'RedHat' else '' }}
+#  --backup --clean-archive {{ postgresql_backup_dir | quote }}
+
+postgresql_pgdata: "{{ '/var/lib/postgresql/' + postgresql_version|string + '/main' if ansible_os_family == 'Debian' else
+                               '/var/lib/pgsql/' + postgresql_version + '/data' if ansible_os_family == 'RedHat'
+}}"
+postgresql_conf_dir: "{{ '/etc/postgresql/' + postgresql_version|string + '/main' if ansible_os_family == 'Debian' else
+                                 '/var/lib/pgsql/' + postgresql_version + '/data' if ansible_os_family == 'RedHat'
+}}"
+postgresql_service_name: "{{  'postgresql' if ansible_os_family == 'Debian' else
+                              'postgresql-' + postgresql_version|string if ansible_os_family == 'RedHat'
+}}"
+
+pg_hba_conf_tmp_dir: /tmp/.pg_hba.conf_assemble

@@ -1,0 +1,15 @@
+---
+
+- name: Ensure database backup file exists
+  ansible.builtin.stat:
+    path: "{{ postgresql_tools_dir }}/{{ db_name }}.sql"
+  register: savedb
+
+- name: Restore database
+#  become: True
+#  become_user: postgres
+  ansible.builtin.shell: "psql -U postgres {{ db_name }} < {{ postgresql_tools_dir }}/{{ db_name }}.sql >{{ postgresql_tools_dir }}/restore_{{ db_name }}.log"
+  args:
+#        chdir: "{{ postgresql_tools_dir }}"
+    creates: "{{ postgresql_tools_dir }}/restore_{{ db_name }}.log"
+  when: savedb.stat.exists

@@ -1,0 +1,161 @@
+#!/bin/bash
+# Script de backup postgresql installé et maintenu par le role ansible postgresql
+# dumps réalisés en local avec le compte postgres
+# les dumps créés sont gzippés
+
+f_usage()
+{
+    echo
+    echo $argument " options de parametre non utilisees :("
+    echo
+#    echo "Usage : $(basename $0) [-Aa|-d db_name] (-j nombre_thread_parallel) !!"
+    echo "Usage : $(basename $0) [-Aa|-d db_name] !!"
+    echo
+    echo "  -A => mode sauvegarde de toutes les databases avec pg_dumpall"
+    echo "  -a => mode sauvegarde de toutes les databases avec pg_dump $pg_dump_opts \$base (liste des bases automatique)"
+    echo "  -d db_name => mode sauvegarde de la seule database \$db_name avec pg_dump $pg_dump_opts \$db_name"
+#    echo "  -j n => sauvegarde avec parallelisme avec \$n threads" # TODO non finalisé ..
+    echo
+    exit 1
+}
+
+f_sauvegarde_base()
+{
+    database=$1
+
+    pg_dump_file={{ postgresql_backup_dir }}/${date_op}_pg_dump-$database.sql
+    [[ $parallel_jobs -gt 0 ]] && pg_dump_file={{ postgresql_backup_dir }}/${date_op}_pg_dump-$database.Fd.sql
+    echo "$(date +%Y%m%d-%H%M%S) pg_dump database $database (+ compress)" >>$log_dump
+    pg_dump $pg_dump_opts $database >$pg_dump_file
+    gzip $pg_dump_file >>$log_dump 2>&1
+    return $?
+}
+
+mode_pg_dumpall="N"
+all_db="N"
+parallel_jobs=0
+pg_dump_opts="-Z 2 -F c"
+excluded_db_from_dump='template'
+unset db_name
+#init des variables par les parametres
+while getopts Aad:j: argument
+do
+  # affectation des variables
+  case $argument in
+    A) mode_pg_dumpall="Y";;
+    a) all_db="Y";;
+    d) db_name=$OPTARG;;
+    j) parallel_jobs=$OPTARG
+       pg_dump_opts="-Z 2 -F d -j $parallel_jobs"
+       ;;
+    *) f_usage;;
+  esac
+done
+# Controle parametres
+if [[ $mode_pg_dumpall == "N" ]] && [[ $all_db == "N" ]] && [[ $db_name == "" ]]
+then
+  echo
+  echo "Il faut une option -A, -a ou -d .."
+  f_usage
+fi
+if [[ $all_db == "Y" ]] && [[ $mode_pg_dumpall == "Y" ]]
+then
+  echo
+  echo "Les options -a et -A sont exclusives .."
+  f_usage
+fi
+if [[ $mode_pg_dumpall == "Y" ]] && [[ $db_name != "" ]]
+then
+  echo
+  echo "Les options -A et -d sont exclusives .."
+  f_usage
+fi
+if [[ $all_db == "Y" ]] && [[ $db_name != "" ]]
+then
+  echo
+  echo "Les options -a et -d sont exclusives .."
+  f_usage
+fi
+
+date_op=$(date +%Y%m%d-%H%M)
+log_dump={{ postgresql_backup_dir }}/${date_op}_$(basename $0 .sh).log
+>$log_dump
+
+# MAIN SCRIPT
+
+echo "$(date +%Y%m%d-%H%M%S) START backup, see $log_dump" | tee -a $log_dump
+
+#############################################
+# Mode sauvegarde de toutes les databases
+#############################################
+if [[ "$db_name" == "" ]]
+then
+    #cd {{ postgresql_backup_dir }}
+
+    echo "$(date +%Y%m%d-%H%M%S) tar server conf files" >>$log_dump
+    tar --exclude="*@*~" -cvf {{ postgresql_backup_dir }}/${date_op}_main_conf_files.tar /etc/postgresql/{{ postgresql_version }}/main >>$log_dump 2>&1
+
+    echo "$(date +%Y%m%d-%H%M%S) dump all globals (+ compress)" >>$log_dump
+    pg_dumpall --globals-only --file={{ postgresql_backup_dir }}/${date_op}_pg_dumpall-globals.sql >>$log_dump 2>&1
+    gzip {{ postgresql_backup_dir }}/${date_op}_pg_dumpall-globals.sql >>$log_dump 2>&1
+#    pg_dumpall --globals-only |gzip -c | openssl enc -aes-256-cbc -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass \
+#               -in - -out {{ postgresql_backup_dir }}/${date_op}_pg_dumpall-globals.sql.gz.enc >>$log_dump 2>&1
+    # On ne teste pas le code retour du pg_dumpall --globals-only
+
+    #############################################
+    # sauvegarde de toutes les databases avec pg_dumpall
+    #############################################
+    if [[ $mode_pg_dumpall == "Y" ]]
+    then
+        echo "$(date +%Y%m%d-%H%M%S) Mode de sauvegarde : toutes les databases avec pg_dumpall" >>$log_dump
+        echo "$(date +%Y%m%d-%H%M%S) pg_dumpall databases (+ compress + encrypt the file)" >>$log_dump
+        pg_dumpall --file={{ postgresql_backup_dir }}/${date_op}_pg_dumpall-databases.sql >>$log_dump 2>&1
+        gzip {{ postgresql_backup_dir }}/${date_op}_pg_dumpall-databases.sql >>$log_dump 2>&1
+#        pg_dumpall |gzip -c | openssl enc -aes-256-cbc -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass \
+#                   -in - -out {{ postgresql_backup_dir }}/${date_op}_pg_dumpall-databases.sql.gz.enc >>$log_dump 2>&1
+        CR_TOT=$?
+
+    #############################################
+    # sauvegarde de toutes les databases avec pg_dump
+    #############################################
+    else
+        echo "$(date +%Y%m%d-%H%M%S) Mode de sauvegarde : toutes les databases avec pg_dump .." >>$log_dump
+        echo "$(date +%Y%m%d-%H%M%S) Recherche des bases a sauvegarder .." >>$log_dump
+        # Recherche des bases a sauvegarder
+        all_db_list=$(psql -q -c "select datname from pg_database" | sed -n 3,/\eof/p |egrep -v "rows\)|lignes\)"|egrep -v "$excluded_db_from_dump"| awk {'print $1'})
+        echo "$(date +%Y%m%d-%H%M%S) Liste : $all_db_list" >>$log_dump
+
+        # Sauvegarde des bases
+        nb_err_sauv=0
+        for db in $all_db_list
+        do
+          f_sauvegarde_base $db
+          [[ $? -ne 0 ]] && ((nb_err_sauv=nb_err_sauv+1))
+        done
+        # On stock le code retour du nombre d'erreurs de pg_dump
+        CR_TOT=$nb_err_sauv
+    fi
+
+#############################################
+# Mode sauvegarde d'1 seule database
+#############################################
+else
+    echo "$(date +%Y%m%d-%H%M%S) Mode de sauvegarde : 1 seule database avec pg_dump .." >>$log_dump
+    f_sauvegarde_base $db_name
+    CR_TOT=$?
+fi
+
+# Purge vieux fichiers
+echo "$(date +%Y%m%d-%H%M%S) purge olds dump ( >{{ postgresql_backup_keep }} days)" >>$log_dump
+find {{ postgresql_backup_dir }} -type f -mtime +{{ postgresql_backup_keep }} -delete >>$log_dump 2>&1
+
+find {{ postgresql_backup_dir }}/ -type f | xargs chmod 640 2>&1
+
+# On sort avec le code retour en fonction des erreurs de pg_dump
+if [[ $CR_TOT -eq 0 ]]
+then
+  echo "$(date +%Y%m%d-%H%M%S) END backup seems to be OK, see $log_dump .." |tee -a $log_dump
+else
+  echo "$(date +%Y%m%d-%H%M%S) END backup KO, see $log_dump .." |tee -a $log_dump
+fi
+exit $CR_TOT

@@ -1,0 +1,194 @@
+---
+
+- name: create users SQL perms block
+  become_user: postgres
+  block:
+
+    - name: CREATE USER {{ db_user_params.db_user }} SQL perms when not superuser block
+      when: db_user_params.db_user_role != "superuser"
+      block:
+
+        # Boucle sur la liste des bases détectées pour retirer le droit de connect sur les autres bases .. vraiment nécessaire ?
+        - name: REVOKE CONNECT ON DATABASE {{ _loop_db_name }} FROM {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _loop_db_name }}"
+            privs: CONNECT
+            type: database
+            roles: "{{ db_user_params.db_user }}"
+            state: absent
+          loop: "{{ databases_info.databases|list }}"
+          loop_control:
+            loop_var: _loop_db_name
+          when: _loop_db_name != _db_name
+
+        - name: GRANT CONNECT ON DATABASE {{ _db_name }} to {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _db_name }}"
+            privs: CONNECT
+            type: database
+            roles: "{{ db_user_params.db_user }}"
+
+        # Inutile si il y a seulement le schéma public ..
+        - name: GRANT USAGE ON SCHEMA {{ _db_name }}.{{ _db_schema_name }} to {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _db_name }}"
+            privs: USAGE
+            type: schema
+            obj: "{{ _db_schema_name }}"
+            roles: "{{ db_user_params.db_user }}"
+
+        # modif du search_path si l'option db_user_search_path est définie dans le fichier des users/pass
+        - name: ALTER ROLE {{ db_user_params.db_user }} SET search_path TO {{ db_user_params.db_user_search_path }}
+          ansible.builtin.shell: psql -c 'ALTER ROLE "{{ db_user_params.db_user }}" SET search_path TO "{{ db_user_params.db_user_search_path }}";'
+          when: db_user_params.db_user_search_path is defined
+
+
+    - name: Create user permissions block when owner block
+      when: db_user_params.db_user_role == "owner"
+      block:
+
+        - name: owner - ALTER DATABASE {{ _db_name }} OWNER TO {{ db_user_params.db_user }}
+#          ansible.builtin.shell: "psql -c 'ALTER DATABASE \"{{ _db_name }}\" OWNER TO \"{{ db_user_params.db_user }}\";'"
+          community.postgresql.postgresql_db:
+            name: "{{ _db_name }}"
+            owner: "{{ db_user_params.db_user }}"
+        # psql -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${USERNAME};"
+        - name: owner - GRANT ALL PRIVILEGES ON DATABASE {{ _db_name }} TO {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _db_name }}"
+            privs: ALL
+            type: database
+            roles: "{{ db_user_params.db_user }}"
+            grant_option: true
+        - name: owner - ALTER SCHEMA {{ _db_name }}.{{ _db_schema_name }} OWNER TO {{ db_user_params.db_user }}
+          community.postgresql.postgresql_schema:
+            db: "{{ _db_name }}"
+            name: "{{ _db_schema_name }}"
+            owner: "{{ db_user_params.db_user }}"
+          when: _db_schema_name != 'public'
+        # est ce qu'on devrait changer le owner du schéma public (owner postgres par défaut) ? => Yes par defaut
+        # TOFIX: cette instruction passe plusieurs fois alors qu'elle ne devrait passer qu'1 seule fois idéalement ..
+        - name: owner - ALTER SCHEMA public OWNER TO {{ db_user_params.db_user }}
+          community.postgresql.postgresql_schema:
+            db: "{{ _db_name }}"
+            name: public
+            owner: "{{ db_user_params.db_user }}"
+          when: public_schema_owns_to_db_owner
+        - name: owner - GRANT ALL PRIVILEGES ON SCHEMA {{ _db_schema_name }} TO {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _db_name }}"
+            privs: ALL
+            type: schema
+            obj: "{{ _db_schema_name }}"
+            roles: "{{ db_user_params.db_user }}"
+            grant_option: true
+
+    - name: Create user permissions block when writer|reader block
+      when: db_user_params.db_user_role is search ('writer|reader')
+      block:
+        # REVOKE CREATE (TABLE) ON schema
+        - name: writer - REVOKE CREATE TABLE FROM {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _db_name }}"
+            privs: CREATE
+            type: schema
+            objs: "{{ item | trim }}"
+            roles: "{{ db_user_params.db_user }}"
+            state: absent
+          loop: "{{ schemata_list.stdout_lines }}"
+
+    - name: Create user permissions block when writer block
+      when: db_user_params.db_user_role == "writer"
+      block:
+        # GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
+        - name: writer - GRANT CRUD privs on all table to {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _db_name }}"
+            objs: ALL_IN_SCHEMA
+            privs: SELECT,INSERT,UPDATE,DELETE
+            type: table
+            roles: "{{ db_user_params.db_user }}"
+            schema: "{{ item | trim }}"
+          loop: "{{ schemata_list.stdout_lines }}"
+        # GRANT EXEC ON PROCEDURE
+        - name: writer - GRANT EXEC privs on all procedure to {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _db_name }}"
+            objs: ALL_IN_SCHEMA
+            privs: EXECUTE
+            type: procedure
+            roles: "{{ db_user_params.db_user }}"
+            schema: "{{ item | trim }}"
+          loop: "{{ schemata_list.stdout_lines }}"
+        # Changement des default privileges pour les objets DEJA crees par le dbowner
+        # afin que les autres users aient des droits par défaut sur les objets que crée le owner
+        # Objs must be set, ALL_DEFAULT to TABLES/SEQUENCES/TYPES/FUNCTIONS
+        # ALL_DEFAULT works only with privs=ALL
+        - name: writer - ALTER DEFAULT PRIVILEGES FOR ROLE {{ db_user_params.db_user }} IN SCHEMA {{ item }} GRANT ALL ON EXISTING TABLES TO {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _db_name }}"
+            objs: ALL_DEFAULT
+            privs: ALL
+            type: default_privs
+            roles: "{{ db_user_params.db_user }}"
+            schema: "{{ item | trim }}"
+          loop: "{{ schemata_list.stdout_lines }}"
+        # Changement des default privileges pour les objets QUI SERONT crees par le dbowner
+        # afin que les autres users aient des droits par défaut sur les objets que crée le owner
+        - name: writer - ALTER DEFAULT PRIVILEGES FOR ROLE {{ db_user_params.db_user }} IN SCHEMA {{ item }} GRANT ALL ON NEW TABLES TO {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _db_name }}"
+            objs: ALL_DEFAULT
+            privs: ALL
+            type: default_privs
+            roles: "{{ db_user_params.db_user }}"
+            target_roles: "{{ _db_schema_owner }}"
+            schema: "{{ item | trim }}"
+          loop: "{{ schemata_list.stdout_lines }}"
+
+    - name: Create user permissions block when reader block
+      when: db_user_params.db_user_role == "reader"
+      block:
+        # REVOKE INSERT, UPDATE, DELETE
+        - name: REVOKE INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {{ _db_schema_name }} FROM {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _db_name }}"
+            state: absent
+            privs: INSERT,UPDATE,DELETE
+            objs: ALL_IN_SCHEMA
+            roles: "{{ db_user_params.db_user }}"
+            schema: "{{ item | trim }}"
+          loop: "{{ schemata_list.stdout_lines }}"
+        # GRANT SELECT
+        - name: reader - GRANT SELECT ALL TABLES ON DATABASE {{ _db_name }} to {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _db_name }}"
+            objs: ALL_IN_SCHEMA
+            privs: SELECT
+            type: table
+            roles: "{{ db_user_params.db_user }}"
+            schema: "{{ item | trim }}"
+          loop: "{{ schemata_list.stdout_lines }}"
+        # Changement des default privileges pour les objets DEJA crees par le dbowner
+        # afin que les autres users aient des droits par défaut sur les objets que crée le owner
+        - name: reader - ALTER DEFAULT PRIVILEGES 'SELECT ON TABLES,SEQUENCES' FOR ROLE {{ db_user_params.db_user }} IN SCHEMA {{ item }} GRANT SELECT ON EXISTING TABLES TO {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _db_name }}"
+            objs: TABLES,SEQUENCES
+            privs: SELECT
+            type: default_privs
+            roles: "{{ db_user_params.db_user }}"
+            schema: "{{ item | trim }}"
+          loop: "{{ schemata_list.stdout_lines }}"
+        # Changement des default privileges pour les objets QUI SERONT crees par le dbowner
+        # afin que les autres users aient des droits par défaut sur les objets que crée le owner
+        - name: writer - ALTER DEFAULT PRIVILEGES FOR ROLE {{ db_user_params.db_user }} IN SCHEMA {{ item }} GRANT SELECT ON NEW TABLES TO {{ db_user_params.db_user }}
+          community.postgresql.postgresql_privs:
+            db: "{{ _db_name }}"
+            objs: TABLES,SEQUENCES
+            privs: SELECT
+            type: default_privs
+            roles: "{{ db_user_params.db_user }}"
+            target_roles: "{{ _db_schema_owner }}"
+            schema: "{{ item | trim }}"
+          loop: "{{ schemata_list.stdout_lines }}"

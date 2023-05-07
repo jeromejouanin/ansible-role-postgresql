@@ -1,0 +1,14 @@
+---
+
+- name: CREATE USER {{ db_user_params.db_user }}
+  become_user: postgres
+  community.postgresql.postgresql_user:
+    state: present
+    name: "{{ db_user_params.db_user }}"
+    password: "{{ db_user_params.db_password }}"
+    role_attr_flags: "{{ 'SUPERUSER' if db_user_params.db_user_role == 'superuser' else '' }}"
+
+# On en profite pour récupérer le schema owner qui servira dans les GRANT (dans create_users_perms_loop.yml)
+- set_fact:
+   _db_schema_owner: "{{ db_user_params.db_user }}"
+  when: db_user_params.db_user_role == 'owner'

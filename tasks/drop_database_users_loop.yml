@@ -1,0 +1,12 @@
+---
+
+# - name : "Drop owned by USER {{ db_user }}"
+#   ansible.builtin.shell: "psql -c 'drop owned by {{ db_user }};'"
+
+- name : "Drop USER {{ db_user_params.db_user }}"
+  # important, sinon les mdp apparaissent dans le log d'exec du playbook ..
+  no_log: true
+  become_user: postgres
+  community.postgresql.postgresql_user:
+    name: "{{ db_user_params.db_user }}"
+    state: absent

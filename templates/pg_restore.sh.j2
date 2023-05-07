@@ -1,0 +1,450 @@
+#!/bin/bash
+# EN COURS : NON TERMINE / NON FIABILISE !
+# Script ayant pour but de restaurer 1 base à partir d'un pg_dump fait avec pg_backup.sh (compressé et encrypté)
+# commande de decrypt si besoin manuel :
+# openssl enc -aes-256-cbc -d -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass -in <fichier.sql.gz.enc> |gunzip - > fichier.sql
+# TODO: la gestion des cas compresses / encrypte / simple sql n'est pas terminée, en attendant on force compressé et encrypté
+
+f_usage()
+{
+    echo
+    echo $argument " options de parametre non utilisees :("
+    echo
+#    echo "Usage : $(basename $0) [-Aa|-d db_name] (-j nombre_thread_parallel) -f dump_file !!"
+    echo "Usage : $(basename $0) -d db_name -f dump_file (-n) !!"
+    echo
+#    echo "  -A => restauration de toutes les databases à partir d'un dump fait avec pg_dumpall"
+#    echo "  -a => restauration de toutes les databases à partir d'un dump fait avec pg_dump $pg_dump_opts \$base (liste des bases automatique)"
+    echo "  -d db_name => restauration de la seule database \$db_name à partir d'un dump fait avec pg_dump $pg_dump_opts \$db_name (obligatoire)"
+#    echo "  -j n => restauration avec parallelisme avec \$n threads, si le dump a été fait dans ce mode"
+    echo "  -f dump_file => nom du fichier de dump à restaurer (obligatoire)"
+    echo "     Ne pas fournir le chemin du fichier qui doit se trouver dans {{ postgresql_backup_dir }}/ par convention"
+    echo "  -n => restauration d'un dump non encrypté"
+    echo
+    exit 1
+}
+
+f_kill_process()
+{
+#set -x
+    db_name=$1
+    log_tmp=$postgresql_backup_log_tmp_dir/f_kill_process_${db_name}.$$.log
+
+    psql -w <<THEEND >$log_tmp
+SELECT pid, usename, application_name, client_addr, client_hostname, query, (SELECT pg_terminate_backend(pid)) as killed
+FROM pg_stat_activity
+WHERE datname='$db_name' and pid<>pg_backend_pid();
+THEEND
+
+    return 0
+}
+
+
+f_drop_all_obj_from_schema()
+{
+    #set -x
+    schema_cible=$1
+    log_drop_all_objects=$postgresql_backup_log_tmp_dir/f_drop_all_obj_from_schema_${db_name}.${schema_cible}.$$.log
+    >$log_drop_all_objects
+    
+    #echo "------------------------------------------------------------------------------------------"
+    echo "$(date +%Y%m%d-%H%M%S) Suppression tous objets sur ${db_name}.${schema_cible} .."
+    
+    LISTE_TABLES_TO_DROP=$(echo "SELECT table_name FROM information_schema.tables WHERE table_schema = '$schema_cible' and table_type='BASE TABLE' order by 1;"|psql -t -d $db_name -w -U $db_user)
+    for T in $LISTE_TABLES_TO_DROP
+    do
+      echo "DROP TABLE $schema_cible.$T CASCADE;" >>$log_drop_all_objects
+      echo "DROP TABLE $schema_cible.$T CASCADE;"|psql -d $db_name -w -U $db_user >>$log_drop_all_objects 2>&1
+    done
+    
+    LISTE_VIEWS_TO_DROP=$(echo "SELECT table_name FROM information_schema.tables WHERE table_schema = '$schema_cible' and table_type='VIEW' order by 1;"|psql -t -d $db_name -w -U $db_user)
+    for V in $LISTE_VIEWS_TO_DROP
+    do
+      echo "DROP VIEW $schema_cible.$V;" >>$log_drop_all_objects
+      echo "DROP VIEW $schema_cible.$V;"|psql -d $db_name -w -U $db_user >>$log_drop_all_objects 2>&1
+    done
+    
+    LISTE_SEQUENCES_TO_DROP=$(echo "SELECT sequence_name FROM information_schema.sequences WHERE sequence_schema = '$schema_cible' order by 1;"|psql -t -d $db_name -w -U $db_user)
+    for S in $LISTE_SEQUENCES_TO_DROP
+    do
+      echo "DROP SEQUENCE $schema_cible.$S;" >>$log_drop_all_objects
+      echo "DROP SEQUENCE $schema_cible.$S;"|psql -d $db_name -w -U $db_user >>$log_drop_all_objects 2>&1
+    done
+    
+    LISTE_FUNCTIONS_TO_DROP=$(echo "SELECT specific_name FROM information_schema.routines WHERE routine_schema = '$schema_cible' order by 1;"|psql -t -d $db_name -w -U $db_user)
+    for F in $LISTE_FUNCTIONS_TO_DROP
+    do
+      FUNC_ID=$(echo $F|awk -F"_" '{ print $NF }')
+      FUNC_NAME=$(echo $F|sed "s/_$FUNC_ID//")
+      FUNC_ARGS=$(echo "SELECT pg_get_function_identity_arguments($FUNC_ID);"|psql -t -d $db_name -w -U $db_user)
+      echo "DROP FUNCTION $schema_cible.$FUNC_NAME($FUNC_ARGS) CASCADE;" >>$log_drop_all_objects
+      echo "DROP FUNCTION $schema_cible.$FUNC_NAME($FUNC_ARGS) CASCADE;"|psql -d $db_name -w -U $db_user >>$log_drop_all_objects 2>&1
+    done
+    
+    #LISTE_DOMAIN_TO_DROP=$(echo "SELECT distinct domain_name FROM information_schema.column_domain_usage WHERE domain_schema = '$schema_cible' order by 1;"|psql -t -d $db_name -w -U $db_user)
+    LISTE_DOMAIN_TO_DROP=$(echo "SELECT typname FROM pg_catalog.pg_type JOIN pg_catalog.pg_namespace ON pg_namespace.oid = pg_type.typnamespace WHERE typtype = 'd' AND nspname = '$schema_cible' order by 1;"|psql -t -d $db_name -w -U $db_user)
+    for D in $LISTE_DOMAIN_TO_DROP
+    do
+      echo "DROP DOMAIN $schema_cible.$D;" >>$log_drop_all_objects
+      echo "DROP DOMAIN $schema_cible.$D;"|psql -d $db_name -w -U $db_user >>$log_drop_all_objects 2>&1
+    done
+    
+    LISTE_TYPE_TO_DROP=$(echo "SELECT user_defined_type_name FROM information_schema.user_defined_types WHERE user_defined_type_schema = '$schema_cible' order by 1;"|psql -t -d $db_name -w -U $db_user)
+    for T in $LISTE_TYPE_TO_DROP
+    do
+      echo "DROP TYPE $schema_cible.$T;" >>$log_drop_all_objects
+      echo "DROP TYPE $schema_cible.$T;"|psql -d $db_name -w -U $db_user >>$log_drop_all_objects 2>&1
+    done
+    
+    CR=$(egrep -c 'ERROR|ERREUR' $log_drop_all_objects)
+    
+    if [[ $CR -eq 0 ]]
+    then
+      echo "$(date +%Y%m%d-%H%M%S) Suppression tous objets sur ${db_name}.${schema_cible} OK"
+    #  tty -s && echo "$(date +%Y%m%d-%H%M%S) Suppression tous objets sur ${db_name}.${schema_cible} OK" >&2
+    else
+      echo "$(date +%Y%m%d-%H%M%S) Erreurs lors de la suppression des objets sur ${db_name}.${schema_cible} CR=$CR / LOG=$log_drop_all_objects:"
+    #  tty -s && echo "$(date +%Y%m%d-%H%M%S) Erreurs lors de la suppression des objets sur ${db_name}.${schema_cible} CR=$CR / LOG=$log_drop_all_objects:" >&2
+      cat $log_drop_all_objects
+    fi
+    return 0
+}
+
+#--------------------------------------------------------------------------------------------------
+#f_truncate_schema()
+#{
+##set -x
+#log_drop_all_objects=$postgresql_backup_log_tmp_dir/f_truncate_schema_${db_name}.${schema}.$$.log
+#>$log_drop_all_objects
+#
+##echo "------------------------------------------------------------------------------------------"
+#echo "$(date +%Y%m%d-%H%M%S) Truncate des tables sur ${db_name}.${schema} .."
+#
+#LISTE_TABLES_TO_TRUNCATE=$(echo "SELECT table_name FROM information_schema.tables WHERE table_schema = '$schema' and table_type='BASE TABLE' order by 1;"|psql -t -d $db_name -w -U $db_user)
+#for T in $LISTE_TABLES_TO_TRUNCATE
+#do
+#  echo "TRUNCATE TABLE $schema.$T RESTART IDENTITY CASCADE;" >>$log_drop_all_objects
+#  echo "TRUNCATE TABLE $schema.$T RESTART IDENTITY CASCADE;"|psql -d $db_name -w -U $db_user >>$log_drop_all_objects 2>&1
+#done
+#
+#CR=$(egrep -c 'ERROR|ERREUR' $log_drop_all_objects)
+#
+#if [[ $CR -eq 0 ]]
+#then
+#  echo "$(date +%Y%m%d-%H%M%S) Truncate des tables sur ${db_name}.${schema} OK"
+##  tty -s && echo "$(date +%Y%m%d-%H%M%S) Truncate des tables sur ${db_name}.${schema} OK" >&2
+#else
+#  echo "$(date +%Y%m%d-%H%M%S) Erreurs lors du truncate des tables des objets sur ${db_name}.${schema} CR=$CR / LOG=$log_drop_all_objects:"
+##  tty -s && echo "$(date +%Y%m%d-%H%M%S) Erreurs lors du truncate des tables sur ${db_name}.${schema} CR=$CR / LOG=$log_drop_all_objects:" >&2
+#  cat $log_drop_all_objects
+#fi
+#return 0
+#}
+
+f_list_schema()
+{
+    #set -x
+    list_schemas=$(echo "SELECT schema_name FROM information_schema.schemata WHERE catalog_name = '$db_name' \
+    and schema_name not in ('pg_toast','pg_catalog', 'information_schema') and schema_name not like '%temp%' order by 1;"|psql -t -d $db_name)
+    CR_CON_DB=$?
+    if [[ $CR_CON_DB -ne 0 ]]
+    then
+      echo
+      echo "$(date +%Y%m%d-%H%M%S) Erreur de connexion à la base .. sortie"
+      echo
+      exit $CR_CON_DB
+    fi
+    echo "$(date +%Y%m%d-%H%M%S) Liste des schemas a recharger sur ${db_name}: $list_schemas"
+    #  tty -s && echo "$(date +%Y%m%d-%H%M%S) Liste des schemas a recharger sur ${db_name}: $list_schemas" >&2
+    
+    return 0
+}
+
+f_restore_schema_obj_and_data()
+{
+    #set -x
+    schema_cible=$1
+    log_tmp=$postgresql_backup_log_tmp_dir/f_restore_schema_obj_and_data.${db_name}.${schema_cible}.$$.log
+    materialized_view_list=$postgresql_backup_log_tmp_dir/f_restore_schema_obj_and_data.materialized_view_list.${db_name}.${schema_cible}.$$.lst
+    no_materialized_view_list=$postgresql_backup_log_tmp_dir/f_restore_schema_obj_and_data.no_materialized_view_list.${db_name}.${schema_cible}.$$.tmp
+
+    echo "$(date +%Y%m%d-%H%M%S)  LOG : $log_tmp"
+    echo "$(date +%Y%m%d-%H%M%S)  Vérification de la présence de vue matérialisée pour le schéma ${schema_cible} dans $dump_file .."
+    if [[ "$mode_encrypt" == "Y" ]]
+    then
+  #    $pg_restore_cmd_prefix pg_restore --dbname=$db_name --schema=$schema_cible -w -l | grep 'MATERIALIZED VIEW DATA' >$materialized_view_list
+      openssl enc -aes-256-cbc -d -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass -in {{ postgresql_backup_dir }}/$dump_file |gunzip -| \
+        pg_restore --dbname=$db_name --schema=$schema_cible -w -l | grep 'MATERIALIZED VIEW DATA' >$materialized_view_list
+    else # mode non encrypté
+      cat {{ postgresql_backup_dir }}/$dump_file |gunzip -| \
+        psql --dbname=$db_name -w -l | grep 'MATERIALIZED VIEW DATA' >$materialized_view_list
+    fi
+    if [[ -s $materialized_view_list ]]
+    then
+      echo "$(date +%Y%m%d-%H%M%S)  Présence de vue matérialisée pour le schéma ${schema_cible} dans $dump_file .."
+#      $pg_restore_cmd_prefix pg_restore --dbname=$db_name --schema=$schema_cible -w -l | sed '/MATERIALIZED VIEW DATA/d' >$no_materialized_view_list
+      openssl enc -aes-256-cbc -d -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass -in {{ postgresql_backup_dir }}/$dump_file |gunzip -| \
+        pg_restore --dbname=$db_name --schema=$schema_cible -w -l | sed '/MATERIALIZED VIEW DATA/d' >$no_materialized_view_list
+      echo "$(date +%Y%m%d-%H%M%S)    1/3 RESTORE SCHEMA ${db_name}.${schema_cible} sans vue matérialisée (option -L $no_materialized_view_list) .."
+#      $pg_restore_cmd_prefix pg_restore --dbname=$db_name --schema=$schema_cible -w -L $no_materialized_view_list >$log_tmp 2>&1
+      openssl enc -aes-256-cbc -d -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass -in {{ postgresql_backup_dir }}/$dump_file |gunzip -| \
+        pg_restore --dbname=$db_name --schema=$schema_cible -w -L $no_materialized_view_list >$log_tmp 2>&1
+      echo "$(date +%Y%m%d-%H%M%S)    2/3 VACUUM ANALYZE SCHEMA ${HOST_CIBLE}.${PORT_CIBLE}.${db_name}.${schema_cible} .."
+      liste_tables_to_analyze=$(echo "SELECT table_name FROM information_schema.tables WHERE table_schema = '$schema_cible' \
+        and table_type='BASE TABLE' order by 1;"|psql -t -d $db_name -w)
+      for tbl in $liste_tables_to_analyze
+      do
+        echo "VACUUM ANALYZE $schema_cible.$tbl;" >>$log_tmp
+        echo "VACUUM ANALYZE $schema_cible.$tbl;"|psql -d $db_name -w >>$log_tmp 2>&1
+      done
+      echo "$(date +%Y%m%d-%H%M%S)    3/3 RESTORE SCHEMA ${db_name}.${schema_cible} des vues matérialisées (option -L $materialized_view_list) .."
+#      $pg_restore_cmd_prefix pg_restore --dbname=$db_name --schema=$schema_cible -w -L $materialized_view_list >>$log_tmp 2>&1
+      openssl enc -aes-256-cbc -d -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass -in {{ postgresql_backup_dir }}/$dump_file |gunzip -| \
+        pg_restore --dbname=$db_name --schema=$schema_cible -w -L $materialized_view_list >>$log_tmp 2>&1
+    else
+      echo "$(date +%Y%m%d-%H%M%S)  Pas de vue matérialisée pour le schéma ${schema_cible} dans $dump_file"
+      echo "$(date +%Y%m%d-%H%M%S)  RESTORE SCHEMA ${db_name}.${schema_cible} .."
+      if [[ "$mode_encrypt" == "Y" ]]
+      then
+  #      $pg_restore_cmd_prefix pg_restore --dbname=$db_name --schema=$schema_cible -w >$log_tmp 2>&1
+        openssl enc -aes-256-cbc -d -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass -in {{ postgresql_backup_dir }}/$dump_file |gunzip -| \
+          pg_restore --dbname=$db_name --schema=$schema_cible -w >$log_tmp 2>&1
+      else # mode non encrypté
+        cat {{ postgresql_backup_dir }}/$dump_file |gunzip -| \
+          psql --dbname=$db_name -w >$log_tmp 2>&1
+      fi
+    fi
+    CR1=$?
+    CR2=$(egrep -c 'ERROR|ERREUR' $log_tmp)
+
+    if [[ $CR1 -eq 0 && $CR2 -eq 0 ]]
+    then
+      echo "$(date +%Y%m%d-%H%M%S)  RESTORE SCHEMA ${db_name}.${schema_cible} OK"
+    #  tty -s && echo "$(date +%Y%m%d-%H%M%S)  RESTORE SCHEMA ${db_name}.${schema_cible} OK" >&2
+    else
+      echo "$(date +%Y%m%d-%H%M%S)  RESTORE SCHEMA ${db_name}.${schema_cible} KO ! code retour =$CR1 / nombre d'erreur =$CR2 / LOG=$log_tmp:"
+    #  tty -s && echo "$(date +%Y%m%d-%H%M%S)  RESTORE SCHEMA ${db_name}.${schema_cible} KO ! code retour =$CR1 / nombre d'erreur =$CR2 / LOG=$log_tmp:" >&2
+      cat $log_tmp
+      LOAD_RESULT="KO"
+    #  Exit_on_error
+    fi
+    return $CR1
+}
+
+#--------------------------------------------------------------------------------------------------
+f_restore_database()
+{
+    #set -x
+    log_tmp=$postgresql_backup_log_tmp_dir/f_restore_database.${db_name}_$$.log
+    materialized_view_list=$postgresql_backup_log_tmp_dir/f_restore_database.materialized_view_list..${db_name}.$$.lst
+    no_materialized_view_list=$postgresql_backup_log_tmp_dir/f_restore_database.no_materialized_view_list..${db_name}.$$.tmp
+
+    echo "$(date +%Y%m%d-%H%M%S)  LOG : $log_tmp"
+    echo "$(date +%Y%m%d-%H%M%S)  Vérification de la présence de vue matérialisée dans $dump_file .."
+    # gestion des options de parallelisme
+    pg_restore_parallel_opts=""
+    [[ $parallel_jobs -gt 0 ]] && pg_restore_parallel_opts="-j $parallel_jobs"
+#    $pg_restore_cmd_prefix pg_restore --dbname=$db_name -w -l | grep 'MATERIALIZED VIEW DATA' >$materialized_view_list
+    openssl enc -aes-256-cbc -d -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass -in {{ postgresql_backup_dir }}/$dump_file |gunzip -| \
+      pg_restore --dbname=$db_name -w -l | grep 'MATERIALIZED VIEW DATA' >$materialized_view_list
+
+    if [[ -s $materialized_view_list ]]
+    then
+      echo "$(date +%Y%m%d-%H%M%S)  Présence de vue matérialisée dans $dump_file .."
+#      $pg_restore_cmd_prefix pg_restore --dbname=$db_name -w -l | sed '/MATERIALIZED VIEW DATA/d' >$no_materialized_view_list
+      openssl enc -aes-256-cbc -d -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass -in {{ postgresql_backup_dir }}/$dump_file |gunzip -| \
+        pg_restore --dbname=$db_name -w -l | sed '/MATERIALIZED VIEW DATA/d' >$no_materialized_view_list
+      echo "$(date +%Y%m%d-%H%M%S)    1/3 RESTORE BASE ${db_name} sans vue matérialisée (option -L $no_materialized_view_list) .."
+#      $pg_restore_cmd_prefix pg_restore --dbname=$db_name -w $pg_restore_parallel_opts -L $no_materialized_view_list >$log_tmp 2>&1
+      openssl enc -aes-256-cbc -d -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass -in {{ postgresql_backup_dir }}/$dump_file |gunzip -| \
+        pg_restore --dbname=$db_name -w $pg_restore_parallel_opts -L $no_materialized_view_list >$log_tmp 2>&1
+      CR1=$?
+      echo "$(date +%Y%m%d-%H%M%S)    2/3 VACUUM ANALYZE BASE ${HOST_CIBLE}.${PORT_CIBLE}.${db_name} .."
+      echo "VACUUM ANALYZE;"|psql -d $db -w >>$log_tmp 2>&1
+      echo "$(date +%Y%m%d-%H%M%S)    3/3 RESTORE BASE ${db_name} des vues matérialisées (option -L $materialized_view_list) .."
+#      $pg_restore_cmd_prefix pg_restore --dbname=$db_name -w $pg_restore_parallel_opts -L $materialized_view_list >>$log_tmp 2>&1
+      openssl enc -aes-256-cbc -d -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass -in {{ postgresql_backup_dir }}/$dump_file |gunzip -| \
+        pg_restore --dbname=$db_name -w $pg_restore_parallel_opts -L $materialized_view_list >>$log_tmp 2>&1
+    else
+      echo "$(date +%Y%m%d-%H%M%S)  Pas de vue matérialisée dans $dump_file"
+      echo "$(date +%Y%m%d-%H%M%S)  RESTORE BASE ${db_name} .."
+#      $pg_restore_cmd_prefix pg_restore --dbname=$db_name -w $pg_restore_parallel_opts >$log_tmp 2>&1
+      openssl enc -aes-256-cbc -d -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass -in {{ postgresql_backup_dir }}/$dump_file |gunzip -| \
+        pg_restore --dbname=$db_name -w $pg_restore_parallel_opts >$log_tmp 2>&1
+      CR1=$?
+    fi
+    CR1=0 # probleme : CR1 retourne 1 pour raison non identifiee
+    CR2=$(egrep -c 'ERROR|ERREUR' $log_tmp)
+
+    # On retire les erreurs connues inutiles :
+    # - les erreurs de creation de schema : Command was: CREATE SCHEMA
+    # - les 261 erreurs de suppression des objets sur le schéma public
+    CREATE_SCHEMA_ERROR_COUNT=$(grep -c 'Command was: CREATE SCHEMA ' $log_tmp)
+    (( CR3 = $CR2 - 261 - $CREATE_SCHEMA_ERROR_COUNT ))
+    [[ $CR3 -lt 0 ]] && CR3=0
+
+    if [[ $CR1 -eq 0 && $CR3 -eq 0 ]]
+    then
+      echo "$(date +%Y%m%d-%H%M%S)  RESTORE BASE ${db_name} OK"
+    #  tty -s && echo "$(date +%Y%m%d-%H%M%S)  RESTORE BASE ${db_name} OK" >&2
+    else
+      echo "$(date +%Y%m%d-%H%M%S)  RESTORE BASE ${db_name} KO ! code retour =$CR1 / nombre d'erreur =$CR3 / LOG=$log_tmp"
+    #  tty -s && echo "$(date +%Y%m%d-%H%M%S)  RESTORE BASE ${db_name} KO ! code retour =$CR1 / nombre d'erreur =$CR3 / LOG=$log_tmp" >&2
+    #  cat $log_tmp
+      LOAD_RESULT="KO"
+    #  Exit_on_error
+    fi
+    return $CR3
+}
+
+mode_pg_dumpall="N"
+mode_full_base="N"
+all_db="N"
+parallel_jobs=0
+mode_encrypt="Y"
+pg_dump_opts="-Z 2 -F c"
+unset db_name
+#init des variables par les parametres
+while getopts Aad:f:j:n argument
+do
+  # affectation des variables
+  case $argument in
+    A) mode_pg_dumpall="Y";;
+    a) all_db="Y";;
+    d) db_name=$OPTARG;;
+    f) dump_file=$OPTARG;;
+    j) parallel_jobs=$OPTARG;;
+    n) mode_encrypt="N";;
+    *) f_usage;;
+  esac
+done
+db_user=postgres
+uncompressed_dump_file=$(basename $dump_file .gz)
+
+# Controle parametres
+if [[ "$dump_file" == "" ]]
+then
+  echo
+  echo "Paramètre -f \$dump_file obligatoire .."
+  echo
+  exit 1
+fi
+if [[ ! -s "{{ postgresql_backup_dir }}/$dump_file" ]]
+then
+  echo
+  echo "Error : file '{{ postgresql_backup_dir }}/$dump_file' not found or empty :("
+  echo
+  exit 1
+fi
+if [[ "$db_name" == "" ]]
+then
+  echo
+  echo "Paramètre -d \$db_name obligatoire .."
+  echo
+  exit 1
+fi
+#if [[ $mode_pg_dumpall == "N" ]] && [[ $all_db == "N" ]] && [[ $db_name == "" ]]
+#then
+#  echo
+#  echo "Il faut une option -A, -a ou -d .."
+#  f_usage
+#fi
+#if [[ $all_db == "Y" ]] && [[ $mode_pg_dumpall == "Y" ]]
+#then
+#  echo
+#  echo "Les options -a et -A sont exclusives .."
+#  f_usage
+#fi
+#if [[ $mode_pg_dumpall == "Y" ]] && [[ $db_name != "" ]]
+#then
+#  echo
+#  echo "Les options -A et -d sont exclusives .."
+#  f_usage
+#fi
+#if [[ $all_db == "Y" ]] && [[ $db_name != "" ]]
+#then
+#  echo
+#  echo "Les options -a et -d sont exclusives .."
+#  f_usage
+#fi
+#if [[ $parallel_jobs -gt 0 ]]
+#then
+##  echo "Mode de restauration avec parallelisme active"
+#  mode_full_base="Y"
+#fi
+
+
+date_op=$(date +%Y%m%d-%H%M)
+log_restore={{ postgresql_backup_dir }}/${date_op}_$(basename $0 .sh)_${dump_file}.log
+postgresql_backup_log_tmp_dir={{ postgresql_backup_dir }}/tmp
+[[ ! -d "$postgresql_backup_log_tmp_dir" ]] && mkdir -p $postgresql_backup_log_tmp_dir
+>$log_restore
+
+# MAIN SCRIPT
+
+if echo $dump_file|grep -q '.gz.enc$'
+then
+  echo "$(date +%Y%m%d-%H%M%S) restore all databases from compressed encrypted file .."  >>$log_restore
+#  openssl enc -aes-256-cbc -d -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass -in {{ postgresql_backup_dir }}/$dump_file |gunzip - \
+#  | psql -U $db_user -d $db_name >>$log_restore 2>&1
+#  CR1=$?
+  pg_restore_cmd_prefix="openssl enc -aes-256-cbc -d -a -salt -pbkdf2 -pass pass:$pg_backup_crypt_pass -in {{ postgresql_backup_dir }}/$dump_file |gunzip -| "
+
+elif echo $dump_file|grep -q '.gz$'
+then
+  echo "$(date +%Y%m%d-%H%M%S) restore all databases from compressed non encrypted file .."  >>$log_restore
+#  gunzip -c {{ postgresql_backup_dir }}/$dump_file | psql -U $db_user -d $db_name  >>$log_restore 2>&1
+#  CR1=$?
+  pg_restore_cmd_prefix="gunzip -c {{ postgresql_backup_dir }}/$dump_file | "
+elif echo $dump_file|grep -q '.sql$'
+then
+  echo "$(date +%Y%m%d-%H%M%S) restore all databases from uncompressed file .."  >>$log_restore
+#  psql -U $db_user -d $db_name < {{ postgresql_backup_dir }}/$uncompressed_dump_file  >>$log_restore 2>&1
+#  CR1=$?
+  pg_restore_cmd_prefix="cat {{ postgresql_backup_dir }}/$uncompressed_dump_file | "
+else
+  echo "$(date +%Y%m%d-%H%M%S) dump file format not understanded .."  >>$log_restore
+  CR1=2
+fi
+
+echo "$(date +%Y%m%d-%H%M%S) START restore, see $log_restore" | tee -a $log_restore
+
+echo "$(date +%Y%m%d-%H%M%S) kill process .." >>$log_restore
+f_kill_process $db_name
+
+# Mode classique restau au niveau schema (tous schemas d'une base)
+if [[ $mode_full_base == "N" ]]
+then
+
+    echo "$(date +%Y%m%d-%H%M%S) Drop objects in schemas from db_name=$db_name before restore .." >>$log_restore
+    f_list_schema >>$log_restore 2>&1
+    nb_err_sauv=0
+    for schema in $list_schemas
+    do
+      f_drop_all_obj_from_schema $schema >>$log_restore 2>&1
+      f_restore_schema_obj_and_data $schema >>$log_restore 2>&1
+      [[ $? -ne 0 ]] && ((nb_err_sauv=nb_err_sauv+1))
+    done
+    CR_TOT=$nb_err_sauv
+
+# Mode base complete !! pas encore finalisé !!
+elif [[ $mode_full_base == "Y" ]]
+then
+
+    echo "$(date +%Y%m%d-%H%M%S) Drop objects in schemas from db_name=$db_name before restore .." >>$log_restore
+    f_list_schema >>$log_restore 2>&1
+    for schema in $list_schemas
+    do
+      f_drop_all_obj_from_schema $schema >>$log_restore 2>&1
+    done
+    f_restore_database
+    CR_TOT=$?
+fi
+
+# On sort avec le code retour en fonction des erreurs de pg_restore
+if [[ $CR_TOT -eq 0 ]]
+then
+  echo "$(date +%Y%m%d-%H%M%S) END restore seems to be OK, see $log_restore .." |tee -a $log_restore
+else
+  echo "$(date +%Y%m%d-%H%M%S) END restore KO, see $log_restore .." |tee -a $log_restore
+fi

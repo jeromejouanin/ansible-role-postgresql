@@ -1,0 +1,59 @@
+---
+
+- set_fact:
+    _db_name: "{{ db_name.split('.')[0] }}"
+    _db_schema_name: "{{ db_name.split('.')[1]|default('public') }}"
+
+- name: set facility var
+  set_fact:
+    inventory_file_key: "{{ (inventory_file | basename).split('.')[0] }}"
+
+- name: get schema list of {{ _db_name }}
+  ansible.builtin.command: psql -t -c "select schema_name from information_schema.schemata where schema_name not in ({{ exclude_sys_schema_list }}) and schema_name not like '%temp%' order by 1;" {{ _db_name }}
+  become_user: postgres
+  register: schemata_list
+  changed_when: False
+
+- debug:
+    msg: "{{ pg_users[inventory_file_key][_db_name] }}"
+    verbosity: 1
+- debug:
+    msg: "db_name {{ _db_name }} / db_user {{ item.db_user }} / db_schema {{ _db_schema_name }}"
+    verbosity: 1
+  loop: "{{ pg_users[inventory_file_key][_db_name] }}"
+
+- name: Create users from vars file loop
+  include_tasks: create_users_loop.yml
+  loop: "{{ pg_users[inventory_file_key][_db_name] }}"
+  loop_control:
+    loop_var: db_user_params
+    label: "db_name {{ _db_name }} / db_user {{ db_user_params.db_user }} / db_user_role {{ db_user_params.db_user_role }}"
+
+# Interdiction aux users de créer des objets (sauf au propriétaire du schéma public)
+# TOFIX: cette instruction passe plusieurs fois alors qu'elle ne devrait passer qu'1 seule fois idéalement ..
+- name: REVOKE CREATE ON SCHEMA public FROM PUBLIC when needed
+  become_user: postgres
+  community.postgresql.postgresql_privs:
+    db: "{{ _db_name }}"
+    state: absent
+    privs: CREATE
+    type: schema
+    obj: public
+    roles: PUBLIC
+  when:
+    - _db_schema_name != 'public'
+    - forbid_create_objs_on_public_schema
+
+- name: Create users's SQL perms from vars file when all users are created loop
+  include_tasks: create_users_perms_loop.yml
+  loop: "{{ pg_users[inventory_file_key][_db_name] }}"
+  loop_control:
+    loop_var: db_user_params
+    label: "db_name {{ _db_name }} / db_user {{ db_user_params.db_user }} / db_user_role {{ db_user_params.db_user_role }}"
+
+- name: Create hba rule for users loop
+  include_tasks: create_hba_rule_loop.yml
+  loop: "{{ pg_users[inventory_file_key][_db_name] }}"
+  loop_control:
+    loop_var: db_user_params
+    label: "db_name {{ _db_name }} / db_user {{ db_user_params.db_user }} / db_user_role {{ db_user_params.db_user_role }}"

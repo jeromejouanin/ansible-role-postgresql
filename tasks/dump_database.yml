@@ -1,0 +1,16 @@
+---
+
+- name: "Check if backup script exists"
+  stat:
+    path: "{{ postgresql_backup_script }}"
+  register: backup_script
+
+- name: dump database
+  become_user: postgres
+  ansible.builtin.shell: |
+      {{ postgresql_backup_command }}
+      {{
+        ' && ' ~ postgresql_backup_post_command if postgresql_backup_post_command is defined else ''
+      }}
+      exit $?
+  when: backup_script.stat.exists
